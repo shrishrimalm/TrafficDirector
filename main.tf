@@ -71,139 +71,192 @@ resource "null_resource" "get_credentials" {
   ]
 }
 
-########################################
-# Traffic Director Backend Service
-########################################
+#####################################################
+# Configuring TLS for the sidecar injector
+####################################################
 
-/*resource "google_compute_network_endpoint_group" "awsneg" {
-  name                  = format("%s-%s", var.aws_resource_name_prefix, "neg")
-  network               = var.networks
-  default_port          = var.awsneg_ports
-  zone                  = var.zone
-  network_endpoint_type = var.aws_network_endpoint_type
-}
-resource "google_compute_network_endpoint_group" "gcpneg" {
-  name                  = format("%s-%s", var.gcp_resource_name_prefix, "neg")
-  network               = var.networks
-  subnetwork            = var.subnets
-  default_port          = var.gcpneg_ports
-  zone                  = var.zone
-  network_endpoint_type = var.gcp_network_endpoint_type
-}
-resource "google_compute_network_endpoint" "awsendpoint" {
-  network_endpoint_group = google_compute_network_endpoint_group.awsneg.name
-  port                   = google_compute_network_endpoint_group.awsneg.default_port
-  ip_address             = var.aws_endpoint_ip
-  zone                   = var.zone
-
-}
-
-resource "google_compute_backend_service" "awsservice" {
-  name                  = format("%s-%s", var.aws_resource_name_prefix, "service")
-  health_checks         = [google_compute_health_check.tdhealthcheck.id]
-  load_balancing_scheme = var.load_balancing_schemes
-  locality_lb_policy    = var.load_balancing_policy
-  backend {
-    group                 = google_compute_network_endpoint_group.awsneg.id
-    balancing_mode        = "RATE"
-    max_rate_per_endpoint = var.max_rate_per_endpoint_compute
+resource "null_resource" "secret_ns_creation" {
+  provisioner "local-exec" {
+    command = "kubectl apply -f td-sidecar-injector-xdsv3/specs/00-namespaces.yaml"
   }
+  depends_on = [
+    null_resource.get_credentials
+  ]
 }
-resource "google_compute_backend_service" "gcpservice" {
-  name                  = format("%s-%s", var.gcp_resource_name_prefix, "service")
-  health_checks         = [google_compute_health_check.tdhealthcheck.id]
-  load_balancing_scheme = var.load_balancing_schemes
-  locality_lb_policy    = var.load_balancing_policy
-  backend {
-    group                 = google_compute_network_endpoint_group.gcpneg.id
-    balancing_mode        = "RATE"
-    max_rate_per_endpoint = var.max_rate_per_endpoint_compute
+
+##############################################
+# Create the secret for the sidecar injector.
+#############################################
+
+resource "kubernetes_secret" "istio-sidecar-injector" {
+  metadata {
+    name      = "istio-sidecar-injector"
+    namespace = "istio-control"
   }
+  data = {
+    "key.pem"      = "${file("td-sidecar-injector-xdsv3/key.pem")}"
+    "cert.pem"     = "${file("td-sidecar-injector-xdsv3/cert.pem")}"
+    "ca-cert.pem"  = "${file("td-sidecar-injector-xdsv3/ca-cert.pem")}"
+  }
+  type = "Opaque"
+  depends_on = [
+    null_resource.secret_ns_creation
+  ]
+}
+
+##############################################
+# Deploy the sidecar injector
+#############################################
+
+resource "null_resource" "deploy_sidecar_injector" {
+  provisioner "local-exec" {
+    command = "kubectl apply -f td-sidecar-injector-xdsv3/specs"
+  }
+  depends_on = [
+    kubernetes_secret.istio-sidecar-injector
+  ]
+}
+
+##############################################
+# Enabling sidecar injection
+#############################################
+
+resource "null_resource" "enable_sidecar_injector" {
+  provisioner "local-exec" {
+    command = "kubectl label namespace default istio-injection=enabled"
+  }
+  depends_on = [
+    null_resource.deploy_sidecar_injector
+  ]
+}
+###################################################
+# Deploying a sample client and verifying injection
+###################################################
+
+resource "null_resource" "deploy_sample_client" {
+  provisioner "local-exec" {
+    command = "kubectl create -f td-sidecar-injector-xdsv3/demo/client_sample.yaml"
+  }
+  depends_on = [
+    null_resource.enable_sidecar_injector
+  ]
+}
+
+##############################################
+# Deploying a Kubernetes service for testing
+##############################################
+
+resource "null_resource" "deploy_kubernetes_service" {
+  provisioner "local-exec" {
+    command = "kubectl create -f td-sidecar-injector-xdsv3/demo/trafficdirector_service_sample.yaml"
+  }
+  depends_on = [
+    null_resource.deploy_sample_client
+  ]
 }
 
 #########################################
 # Traffic Director Health Check
 #########################################
-resource "google_compute_health_check" "tdhealthcheck" {
-  provider = google-beta
-  name     = "tdhealthcheck"
+
+resource "google_compute_health_check" "td-gke-health-check" {
+  name     = "td-gke-health-check"
   http_health_check {
-    port = var.ports
+    port = "80"
   }
 }
 
+##############################################################
+# Firewall rule to allow the health checker IP address ranges
+##############################################################
 
-############################################
-#Traffic Director Routes
-############################################
-resource "google_compute_url_map" "tdroutes" {
-  name            = "tdroutes"
-  description     = "traffic director routes"
-  default_service = google_compute_backend_service.awsservice.id
+resource "google_compute_firewall" "fw-allow-health-checks" {
+  name          = "fw-allow-health-checks"
+  network       = "default"
+  direction     = "INGRESS"
+  source_ranges = ["35.191.0.0/16", "130.211.0.0/22"]
+
+  allow {
+    protocol = "tcp"
+  }
+}
+
+############################################################################################
+# Create the backend service and associate the health check and NEG with the backend service
+############################################################################################
+
+data "google_compute_network_endpoint_group" "gcpneg" {
+  project = var.project_id
+  name    = "service-test-neg"
+  zone    = "us-central1-a"
+  depends_on = [
+    null_resource.deploy_kubernetes_service
+  ]
+}
+
+resource "google_compute_backend_service" "td-gke-service" {
+  name                  = "td-gke-service"
+  health_checks         = [google_compute_health_check.td-gke-health-check.id]
+  load_balancing_scheme = "INTERNAL_SELF_MANAGED"
+  backend {
+    group                 = data.google_compute_network_endpoint_group.gcpneg.id
+    balancing_mode        = "RATE"
+    max_rate_per_endpoint = 5
+  }
+  depends_on = [
+    google_compute_health_check.td-gke-health-check
+  ]
+}
+
+########################################################################
+# URL map that uses td-gke-service as the default backend service
+#########################################################################
+
+resource "google_compute_url_map" "td-gke-url-map" {
+  name            = "td-gke-url-map"
+  default_service = google_compute_backend_service.td-gke-service.id
 
   host_rule {
-    hosts        = [var.host_name]
-    path_matcher = "allpaths"
+    hosts        = ["service-test"]
+    path_matcher = "td-gke-path-matcher"
   }
-  path_matcher {
-    name            = "allpaths"
-    default_service = google_compute_backend_service.awsservice.id
 
-    route_rules {
-      priority = var.route_priority
-      match_rules {
-        prefix_match = "/"
-      }
-      route_action {
-        weighted_backend_services {
-          backend_service = google_compute_backend_service.awsservice.id
-          weight          = var.aws_weight
-        }
-        weighted_backend_services {
-          backend_service = google_compute_backend_service.gcpservice.id
-          weight          = var.gcp_weight
-        }
-      }
-    }
+  path_matcher {
+    name            = "td-gke-path-matcher"
+    default_service = google_compute_backend_service.td-gke-service.id
   }
-  test {
-    service = google_compute_backend_service.awsservice.id
-    host    = var.host_name
-    path    = "/*"
-  }
+
+  depends_on = [
+    google_compute_backend_service.td-gke-service
+  ]
 }
 
 #############################################
 # Target HTTP Proxy
 #############################################
-resource "google_compute_target_http_proxy" "fwproxy" {
-  name    = "fwproxy"
-  url_map = google_compute_url_map.tdroutes.id
+
+resource "google_compute_target_http_proxy" "td-gke-proxy" {
+  name    = "td-gke-proxy"
+  url_map = google_compute_url_map.td-gke-url-map.id
+  depends_on = [
+    google_compute_url_map.td-gke-url-map
+  ]
 }
 
-##########################################
-# Traffic Director Global Forwarding Rule
-##########################################
-resource "google_compute_global_forwarding_rule" "awsfwrule" {
-  name                  = format("%s-%s", var.aws_resource_name_prefix, "fwrule")
-  provider              = google
-  network               = var.networks
-  load_balancing_scheme = var.load_balancing_schemes
-  port_range            = var.ports
-  target                = google_compute_target_http_proxy.fwproxy.id
-  ip_address            = var.awsfwrule_ip
+#############################################
+# Global Forwarding Rule
+#############################################
 
+resource "google_compute_global_forwarding_rule" "td-gke-forwarding-rule" {
+  name                  = "td-gke-forwarding-rule"
+  target                = google_compute_target_http_proxy.td-gke-proxy.id
+  load_balancing_scheme = "INTERNAL_SELF_MANAGED"
+  port_range            = "80"
+  ip_address            = "0.0.0.0"
+  network               = "default"
+  depends_on = [
+    google_compute_target_http_proxy.td-gke-proxy
+  ]
 }
 
-resource "google_compute_global_forwarding_rule" "gcpfwrule" {
-  name                  = format("%s-%s", var.gcp_resource_name_prefix, "fwrule")
-  provider              = google
-  network               = var.networks
-  load_balancing_scheme = var.load_balancing_schemes
-  port_range            = var.ports
-  target                = google_compute_target_http_proxy.fwproxy.id
-  ip_address            = var.gcpfwrule_ip
-
-}*/
-
-
+#############################################################
