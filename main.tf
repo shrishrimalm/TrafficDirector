@@ -275,7 +275,7 @@ resource "null_resource" "deploy_kubernetes_service" {
 resource "google_compute_health_check" "td-gke-health-check" {
   name     = "td-gke-health-check"
   http_health_check {
-    port = "443"
+    port = "80"
   }
 }
 
