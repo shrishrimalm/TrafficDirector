@@ -38,7 +38,7 @@ resource "google_project_iam_binding" "trafficdirector_client" {
   ]
 }
 ###################################
-#Creating Zonal GKE Public Cluster
+# Creating Zonal GKE Cluster
 #####################################
 
 resource "google_container_cluster" "traffic-director-cluster" {
@@ -52,6 +52,11 @@ resource "google_container_cluster" "traffic-director-cluster" {
     ]
   } 
   ip_allocation_policy {}
+  /*private_cluster_config {
+    #enable_private_endpoint = true
+    enable_private_nodes = true
+    master_ipv4_cidr_block     = "10.0.0.0/28"
+  }*/
   timeouts {
     create = "30m"
     update = "40m"
@@ -71,18 +76,103 @@ resource "null_resource" "get_credentials" {
   ]
 }
 
+
+#####################################################
+# Opening required port on a private cluster
+####################################################
+/*
+resource "null_resource" "update_firewall_rule" {
+  provisioner "local-exec" {
+    command = "gcloud compute firewall-rules update gke-traffic-director-cluster-ae978e47-master --allow tcp:10250,tcp:443,tcp:9443"
+  }
+  depends_on = [
+    null_resource.get_credentials
+  ]
+}*/
+
+############################################
+#  Configuring the sidecar injector
+############################################
+
+resource "null_resource" "replace_project_number" {
+  provisioner "local-exec" {
+    command = "sed -i 's/your-project-here/629996305394/g' '${path.module}/td-sidecar-injector-xdsv3/specs/01-configmap.yaml'"
+  }
+}
+
+resource "null_resource" "replace_network_value" {
+  provisioner "local-exec" {
+    command = " sed -i 's/your-network-here/default/g' '${path.module}/td-sidecar-injector-xdsv3/specs/01-configmap.yaml' "
+  }
+  depends_on = [
+    null_resource.replace_project_number
+  ]
+}
+
+
 #####################################################
 # Configuring TLS for the sidecar injector
 ####################################################
+
+resource "tls_private_key" "privatekey" {
+  algorithm = "RSA"
+  rsa_bits  = "4096"
+}
+
+resource "local_file" "key_pem" {
+  content  = "${tls_private_key.privatekey.private_key_pem}"
+  filename = "${path.module}/td-sidecar-injector-xdsv3/key.pem"
+}
+
+resource "tls_self_signed_cert" "cakey" {
+  private_key_pem   = "${tls_private_key.privatekey.private_key_pem}"
+  is_ca_certificate = true
+  
+  dns_names = ["istio-sidecar-injector.istio-control.svc"]
+
+  subject {
+    common_name         = "istio-sidecar-injector.istio-control.svc"
+  }
+
+  validity_period_hours = 8760
+
+  allowed_uses = [
+    "key_encipherment",
+    "digital_signature",
+    "server_auth",
+  ]
+  depends_on = [
+    tls_private_key.privatekey
+  ]
+}
+
+resource "local_file" "ca_key" {
+  content  = "${tls_self_signed_cert.cakey.cert_pem}"
+  filename = "${path.module}/td-sidecar-injector-xdsv3/cert.pem"
+}
+
+resource "local_file" "ca_cert" {
+  content  = "${tls_self_signed_cert.cakey.cert_pem}"
+  filename = "${path.module}/td-sidecar-injector-xdsv3/ca-cert.pem"
+  depends_on = [
+    tls_self_signed_cert.cakey
+  ]
+}
+
+############################################################################
+# Create the namespace under which the Kubernetes secret should be created
+############################################################################
 
 resource "null_resource" "secret_ns_creation" {
   provisioner "local-exec" {
     command = "kubectl apply -f td-sidecar-injector-xdsv3/specs/00-namespaces.yaml"
   }
   depends_on = [
+    local_file.ca_cert,
     null_resource.get_credentials
   ]
 }
+
 
 ##############################################
 # Create the secret for the sidecar injector.
@@ -100,8 +190,30 @@ resource "kubernetes_secret" "istio-sidecar-injector" {
   }
   type = "Opaque"
   depends_on = [
-    null_resource.secret_ns_creation
+    null_resource.secret_ns_creation,
+    local_file.ca_cert,
+    local_file.ca_key,
+    local_file.key_pem
   ]
+}
+
+##############################################
+# Modify the caBundle of the sidecar injection
+##############################################
+
+# Base64-encode the contents of the cert.pem file
+data "local_file" "cert" {
+  filename = "${path.module}/td-sidecar-injector-xdsv3/cert.pem"
+}
+
+locals {
+  ca_bundle = "${base64encode(data.local_file.cert.content)}"
+}
+
+resource "null_resource" "replace_caBundle" {
+  provisioner "local-exec" {
+    command = " sed -i 's/caBundle:.*/caBundle: ${local.ca_bundle}/g' '${path.module}/td-sidecar-injector-xdsv3/specs/02-injector.yaml' "
+  }
 }
 
 ##############################################
@@ -113,7 +225,8 @@ resource "null_resource" "deploy_sidecar_injector" {
     command = "kubectl apply -f td-sidecar-injector-xdsv3/specs"
   }
   depends_on = [
-    kubernetes_secret.istio-sidecar-injector
+    kubernetes_secret.istio-sidecar-injector,
+    null_resource.get_credentials
   ]
 }
 
@@ -162,7 +275,7 @@ resource "null_resource" "deploy_kubernetes_service" {
 resource "google_compute_health_check" "td-gke-health-check" {
   name     = "td-gke-health-check"
   http_health_check {
-    port = "80"
+    port = "443"
   }
 }
 
