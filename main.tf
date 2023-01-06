@@ -52,11 +52,13 @@ resource "google_container_cluster" "traffic-director-cluster" {
     ]
   } 
   ip_allocation_policy {}
-  /*private_cluster_config {
+
+  private_cluster_config {
     #enable_private_endpoint = true
     enable_private_nodes = true
     master_ipv4_cidr_block     = "10.0.0.0/28"
-  }*/
+  }
+
   timeouts {
     create = "30m"
     update = "40m"
@@ -80,15 +82,41 @@ resource "null_resource" "get_credentials" {
 #####################################################
 # Opening required port on a private cluster
 ####################################################
-/*
-resource "null_resource" "update_firewall_rule" {
+
+
+resource "null_resource" "get_firewall_details" {
   provisioner "local-exec" {
-    command = "gcloud compute firewall-rules update gke-traffic-director-cluster-ae978e47-master --allow tcp:10250,tcp:443,tcp:9443"
+    command = "gcloud compute firewall-rules list --filter='name~gke-traffic-director-cluster-[0-9a-z]*-master' --format='value(name)' > firewall.txt "
+    interpreter = ["bash", "-c"]
   }
   depends_on = [
+    google_container_cluster.traffic-director-cluster,
     null_resource.get_credentials
   ]
-}*/
+}
+
+data "local_file" "firewall" {
+  filename = "firewall.txt"
+  depends_on = [
+    null_resource.get_firewall_details
+  ]
+}
+
+locals {
+  firewall_rule_name = "${replace(data.local_file.firewall.content, "\r\n", "")}"
+}
+
+resource "null_resource" "update_firewall_rule" {
+  provisioner "local-exec" {
+    command = "gcloud compute firewall-rules update ${local.firewall_rule_name} --allow tcp:10250,tcp:443,tcp:9443"
+  }
+  depends_on = [
+    google_container_cluster.traffic-director-cluster,
+    null_resource.get_credentials,
+    null_resource.get_firewall_details
+  ]
+}
+
 
 ############################################
 #  Configuring the sidecar injector
@@ -119,11 +147,6 @@ resource "tls_private_key" "privatekey" {
   rsa_bits  = "4096"
 }
 
-resource "local_file" "key_pem" {
-  content  = "${tls_private_key.privatekey.private_key_pem}"
-  filename = "${path.module}/td-sidecar-injector-xdsv3/key.pem"
-}
-
 resource "tls_self_signed_cert" "cakey" {
   private_key_pem   = "${tls_private_key.privatekey.private_key_pem}"
   is_ca_certificate = true
@@ -142,20 +165,8 @@ resource "tls_self_signed_cert" "cakey" {
     "server_auth",
   ]
   depends_on = [
-    tls_private_key.privatekey
-  ]
-}
-
-resource "local_file" "ca_key" {
-  content  = "${tls_self_signed_cert.cakey.cert_pem}"
-  filename = "${path.module}/td-sidecar-injector-xdsv3/cert.pem"
-}
-
-resource "local_file" "ca_cert" {
-  content  = "${tls_self_signed_cert.cakey.cert_pem}"
-  filename = "${path.module}/td-sidecar-injector-xdsv3/ca-cert.pem"
-  depends_on = [
-    tls_self_signed_cert.cakey
+    tls_private_key.privatekey,
+    null_resource.update_firewall_rule
   ]
 }
 
@@ -168,11 +179,11 @@ resource "null_resource" "secret_ns_creation" {
     command = "kubectl apply -f td-sidecar-injector-xdsv3/specs/00-namespaces.yaml"
   }
   depends_on = [
-    local_file.ca_cert,
-    null_resource.get_credentials
+    null_resource.get_credentials,
+    tls_self_signed_cert.cakey,
+    tls_private_key.privatekey
   ]
 }
-
 
 ##############################################
 # Create the secret for the sidecar injector.
@@ -184,16 +195,15 @@ resource "kubernetes_secret" "istio-sidecar-injector" {
     namespace = "istio-control"
   }
   data = {
-    "key.pem"      = "${file("td-sidecar-injector-xdsv3/key.pem")}"
-    "cert.pem"     = "${file("td-sidecar-injector-xdsv3/cert.pem")}"
-    "ca-cert.pem"  = "${file("td-sidecar-injector-xdsv3/ca-cert.pem")}"
+    "key.pem"      = "${tls_private_key.privatekey.private_key_pem}"
+    "cert.pem"     = "${tls_self_signed_cert.cakey.cert_pem}"
+    "ca-cert.pem"  = "${tls_self_signed_cert.cakey.cert_pem}"
   }
   type = "Opaque"
   depends_on = [
     null_resource.secret_ns_creation,
-    local_file.ca_cert,
-    local_file.ca_key,
-    local_file.key_pem
+    tls_self_signed_cert.cakey,
+    tls_private_key.privatekey
   ]
 }
 
@@ -201,13 +211,12 @@ resource "kubernetes_secret" "istio-sidecar-injector" {
 # Modify the caBundle of the sidecar injection
 ##############################################
 
-# Base64-encode the contents of the cert.pem file
-data "local_file" "cert" {
-  filename = "${path.module}/td-sidecar-injector-xdsv3/cert.pem"
-}
-
 locals {
-  ca_bundle = "${base64encode(data.local_file.cert.content)}"
+  ca_bundle = "${base64encode("${tls_self_signed_cert.cakey.cert_pem}")}"
+  depends_on = [
+    tls_self_signed_cert.cakey,
+    tls_private_key.privatekey
+  ]
 }
 
 resource "null_resource" "replace_caBundle" {
@@ -226,7 +235,9 @@ resource "null_resource" "deploy_sidecar_injector" {
   }
   depends_on = [
     kubernetes_secret.istio-sidecar-injector,
-    null_resource.get_credentials
+    null_resource.get_credentials,
+    tls_self_signed_cert.cakey,
+    tls_private_key.privatekey
   ]
 }
 

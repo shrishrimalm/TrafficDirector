@@ -4,7 +4,18 @@ variable "project_id" {
   description = "The ID of the project in which the resource belongs"
 }
 
-/*variable "region" {
+/*
+variable "project_number" {
+  type        = string
+  description = "Project number in which the resource belongs"
+} 
+
+variable "networks" {
+  type        = string
+  description = "The network id to which all network endpoints in the NEG belong."
+}
+
+variable "region" {
   type        = string
   description = "The GCP region for this subnetwork"
 }
@@ -12,11 +23,6 @@ variable "project_id" {
 variable "zone" {
   type        = string
   description = "Zone where the network endpoint group is located"
-}
-
-variable "networks" {
-  type        = string
-  description = "The network id to which all network endpoints in the NEG belong."
 }
 
 variable "subnets" {

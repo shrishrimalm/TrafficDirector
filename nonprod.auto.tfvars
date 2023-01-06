@@ -1,7 +1,8 @@
 project_id                    = "gke-envoy-setup"
-/*region                        = "us-east4"
-zone                          = "us-east4-a"
+/*project_number                = "629996305394"
 networks                      = "default"
+region                        = "us-east4"
+zone                          = "us-east4-a"
 subnets                       = "10.128.0.0/16"
 host_name                     = "traffic-split"
 aws_network_endpoint_type     = "NON_GCP_PRIVATE_IP_PORT"
@@ -19,4 +20,5 @@ aws_weight                    = "0"
 gcp_weight                    = "100"
 awsfwrule_ip                  = "10.10.0.2"
 gcpfwrule_ip                  = "10.10.0.3"
-max_rate_per_endpoint_compute = "5"*/
+max_rate_per_endpoint_compute = "5"
+*/
